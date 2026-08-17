@@ -15,7 +15,7 @@ Operate the xTS Failure Tracker system through its web API. The system stores pe
 ## HARD RULES (never violate)
 
 1. **NEVER touch the database file directly.** All reads and writes MUST go through the web HTTP API. Do NOT open `.db` files, do NOT run `sqlite3`, do NOT run SQL. Never fall back to editing `.db` directly to "get around" an API error.
-2. **Always ask the user for the API base URL** at the start of any task. The deployment address changes and may move servers, so never hardcode or assume it. Store the URL for the rest of the session.
+2. **API base URL**: The system is deployed at a fixed address — `http://androidtools.agents.nxp.com/xts-tracker/`. Use this as the default `{BASE}` for all API calls. Only ask the user if this address is unreachable or the user indicates it has moved.
 3. **Always ask the user for their identity** before any write:
    - `changed_by` — recorded in change history for status/detail edits.
    - For owner changes and imports: ask for the **admin password** (these are admin-only).
@@ -43,7 +43,9 @@ The system uses surname-first pinyin names ("xTS names") as the canonical owner 
 | Yunjie Jia | Jia Yunjie | |
 | Hui Fang | Fang Hui | |
 
-Additional owners not in the table above (no English name mapping, match by xTS name directly): `Liu Xuegang`, `Bao Xiahong`, `Zhang Bo`, `Zhou Ming`, `Xu Mao`, `Li Jian`, `Wang Hui`.
+Additional owners not in the table above (no English name mapping, match by xTS name directly): `Liu Xuegang`, `Bao Xiahong`, `Zhou Ming`, `Xu Mao`, `Li Jian`.
+
+**Departed owners (do NOT assign new work to them):** `Wang Hui` (handed over to `Sun Dandan`), `Zhang Bo` (handed over to `Zhai He`). They still appear in historical data, so they remain valid for **querying/filtering** existing cases, but must NEVER be used as the target of a new owner assignment. If the user asks to assign work to a departed owner, use the handover target instead and tell the user.
 
 Examples of fuzzy resolution:
 - "我是 BAO" → `Bao Xiahong` (only one Bao)
@@ -81,12 +83,13 @@ All case lookups follow these rules:
 
 ## API reference
 
-`{BASE}` is provided by the user.
+`{BASE}` defaults to `http://androidtools.agents.nxp.com/xts-tracker/` (fixed deployment). Only override if the user says it has moved.
 
 ### Read (no auth)
 - `GET {BASE}/api/releases` — list release names (newest first).
-- `GET {BASE}/api/{release}/meta` — `{boards, owners, statuses, locked}`. Use `statuses` as the valid **status whitelist** and `owners` as the valid **owner list**.
-- `GET {BASE}/api/{release}/failures?suite=&board=&status=&owner=&keyword=&page=&page_size=` — search/list cases. `page_size` max 200. `keyword` matches inside `case_name`. To filter empty owner/status use the literal value `__none__`.
+- `GET {BASE}/api/{release}/meta` — `{boards, owners, active_owners, statuses, rc_versions, locked}`. Use `statuses` as the valid **status whitelist**; `owners` is the full list (incl. historical/departed) for **filtering**; `active_owners` is the list valid for **new assignment**; `rc_versions` are the RC values present in this release.
+- `GET {BASE}/api/{release}/failures?suite=&board=&status=&owner=&rc_version=&keyword=&page=&page_size=` — search/list cases. `page_size` max 200. `board`/`status`/`owner`/`rc_version` accept **multiple values** (repeat the param, e.g. `board=8QM&board=8MP`) and are OR-ed within each field. `keyword` matches inside `case_name`. To filter empty owner/status use the literal value `__none__`.
+- `GET {BASE}/api/{release}/command?suite=&board=&status=&owner=&rc_version=&keyword=` — generate the xTS runner `--include-filter` command for the matched cases (suite required). Returns `{command, count}`.
 - `GET {BASE}/api/{release}/stats/need-check` — per-suite Need-Check counts by owner.
 
 ### User-level write (no password, needs `changed_by`)
@@ -96,7 +99,7 @@ All case lookups follow these rules:
 ### Admin-level write (header `x-admin-password: <password>`)
 - `PATCH {BASE}/api/admin/{release}/failures/{id}` with JSON containing any of `{"owner","status","detail","rc_version"}`.
   - This is the **only** way to change `owner`.
-- `POST {BASE}/api/admin/{release}/import` — multipart form: `suite` (string), `board` (string), `file` (HTML or Excel report file).
+- `POST {BASE}/api/admin/{release}/import` — multipart form: `suite` (string), `board` (string), `file` (HTML, Excel, or `need_check.txt`). The `.txt` format is `module<TAB>case_name` per line.
 - `GET {BASE}/api/admin/verify` — check admin credentials.
 
 ## Operation A — Batch edit status / detail
@@ -137,6 +140,119 @@ Use `GET {BASE}/api/{release}/failures` with `suite`, `board`, `status`, `owner`
    > 这两步必须按顺序做，不可跳过。AI 无法执行这两个操作。
 
    Do NOT attempt to call the dedup or assign API endpoints. These operations require interactive review in the web UI.
+
+## Operation E — "升级xts": auto-import new reports from a report server (Admin)
+
+Trigger: the user says **"升级xts"** / "upgrade xts" / "导入最新报告", or gives report URLs
+directly. The test team publishes xTS results to report servers; this operation finds
+reports not yet imported into the tracker and imports only those.
+
+**CONFIRMATION GATE (mandatory).** This operation is destructive (writes to the tracker
+DB). At EVERY step below you MUST stop and get the user's explicit confirmation before
+proceeding to the next step — never chain steps automatically. In particular, confirm:
+the report source, the resolved release, EVERY board-name mapping, and the final list of
+(suite, board) pairs to import. If any board mapping is ambiguous, STOP and ask; never guess.
+
+### Report sources
+
+There are two known report-server layouts. Detect which one the user's URL/base matches,
+or ask the user which source to use.
+
+**Source A — `http://10.52.9.140/xTS_Report/`** (release-RC directory layout):
+```
+http://10.52.9.140/xTS_Report/
+  android-<major>.0.0_<x.y.z>-rc<n>/     <- one directory per release+RC
+    <BOARD>/                             <- board directory (report-server naming)
+      <SUITE>/                           <- CTS / CTS-on-GSI / GTS / STS / VTS
+        need_check.txt                   <- the file to import (TAB: module<TAB>case_name)
+        need_checks.xml                  <- same list, SubPlan XML (do NOT import)
+        *_test_results.xls               <- raw CTS result (do NOT import)
+```
+Import **`need_check.txt`** (natively supported; `module<TAB>case_name`). Do NOT import `.xls`/`.xml`.
+
+**Source B — `http://10.193.108.180/share_write/xts_autorun/`** (suite/board/timestamp layout):
+```
+http://10.193.108.180/share_write/xts_autorun/
+  <suite>/                               <- vts / cts / cts-on-gsi / gts / sts (lowercase)
+    <board_dir>/                         <- e.g. evk_8mp, mek_8qm, frdm_937 (see mapping)
+      <YYYY.MM.DD_HH.MM.SS>/             <- timestamped run; use the newest per board
+        test_result_failures_suite.html <- the file to import (standard CTS/VTS HTML report)
+```
+Import **`test_result_failures_suite.html`** (standard HTML report; natively parsed).
+The user often pastes the full URLs directly — one per (board, run).
+
+### Step E1 — locate the reports
+
+- **Source A**: list `http://10.52.9.140/xTS_Report/`; among `android-<number>...` dirs pick
+  the latest (highest android version, then x.y.z, then rc, or newest mtime).
+- **Source B**: use the URLs the user pasted, or list
+  `http://10.193.108.180/share_write/xts_autorun/<suite>/<board_dir>/` and take the
+  newest timestamp directory per board.
+- Tell the user which reports were selected and **get confirmation**.
+
+### Step E2 — map the report to a tracker release
+
+- **Source A**: dir `android-<M>.0.0_<x.y.z>-rc<n>` → release `imx_android-<M>.0_<x.y.z>`.
+  Example: `android-16.0.0_2.0.0-rc3` → `imx_android-16.0_2.0.0`.
+- **Source B**: the report has no release in its path; read the HTML `Suite / Build`
+  field (e.g. `17_r1` = Android 17) to infer the android version, or **ask the user**
+  which release to import into.
+This is a convention, not a strict rule. **Always verify against `GET {BASE}/api/releases`**;
+if no exact match, list candidates and ask the user.
+
+### Step E3 — map board directory names to tracker board names
+
+Report-server board names differ from the tracker's `meta.boards`. **The mapping is NOT
+guessable from the name** (e.g. `evk_8ulp` → `8ULP9`, not `8ULP`). Resolve each report
+board using the table below, confirm it exists in `GET {BASE}/api/{release}/meta` →
+`boards`, and **have the user confirm every mapping**. If a report board is not in the
+table or is ambiguous, STOP and ask — never guess.
+
+**Source A (`10.52.9.140`):**
+
+| Report-server dir | Tracker board |
+|---|---|
+| `8MQ_WEVK` | `8MQWEVK` |
+| `8ULP_9x9` | `8ULP9` |
+| all others (`8QM`, `8QXP`, `8MM`, `8MP`, `8MN`, `8ULP`, `95_15x15_FRDM`, `95_19x19`, `952_15x15`, `952_19x19`, `943`, ...) | same name |
+
+**Source B (`10.193.108.180`, `evk_`/`mek_`/`frdm_` prefixed):**
+
+| Report-server dir | Tracker board |
+|---|---|
+| `mek_8qm` | `8QM` |
+| `mek_8qxp` | `8QXP` |
+| `evk_8mm` | `8MM` |
+| `evk_8mn` | `8MN` |
+| `evk_8mp` | `8MP` |
+| `evk_8mq` | `8MQWEVK` |
+| `evk_8ulp` | `8ULP9` |
+| `evk_95` | `95_19x19` |
+| `evk_952` | `952_19x19` |
+| `frdm_952` | `952_15x15_FRDM` |
+| `frdm_937` | `937FRDM` |
+
+If a report board maps to a name NOT in `meta.boards` for that release, SKIP it and
+report it to the user (import would fail with `board not defined for this release`).
+
+### Step E4 — determine which (suite, board) are new
+
+1. `GET {BASE}/api/{release}/meta` → `imported` is `{suite: [board, ...]}` already imported.
+2. For each report's (mapped board, suite): if it is NOT already in `meta.imported[suite]`,
+   mark it for import. Skip already-imported pairs unless the user asks to re-import.
+3. **Present the final import list to the user and get confirmation before writing.**
+
+### Step E5 — import each confirmed report
+
+For each confirmed (suite, board): download the report file (Source A: `need_check.txt`;
+Source B: `test_result_failures_suite.html`), then
+`POST {BASE}/api/admin/{release}/import` as multipart form with `suite`, mapped `board`,
+and the file. Report `added`/`updated` per pair, and a summary of skipped pairs.
+
+### Step E6 — mandatory post-import reminder
+
+After all imports, deliver the SAME reminder as Operation D (dedup then assign in the
+web UI). Deduplicate and Assign stay manual — do NOT call those APIs.
 
 ## Failure handling
 
