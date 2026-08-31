@@ -20,6 +20,14 @@ Operate the xTS Failure Tracker system through its web API. The system stores pe
    - `changed_by` — recorded in change history for status/detail edits.
    - For owner changes and imports: ask for the **admin password** (these are admin-only).
 4. **Owner and status columns have database-level foreign key constraints** (`PRAGMA foreign_keys = ON`). Invalid values are rejected at the DB layer. The skill does not need to independently validate owner/status — the DB is the final arbiter.
+5. **IMPORT WRITES THE DATABASE — TREAT IT AS DANGEROUS.** An import mutates the live release database and is not trivially undoable. A wrong suite/board/release/source can pollute real data or need a full restore from backup. **Before EVERY import, STOP and get the user's explicit confirmation of all four:**
+   - **Suite** (CTS / VTS / CTS-on-GSI / GTS / STS)
+   - **Board** (the tracker board name it will write to, after mapping)
+   - **Database / release** (which `imx_android-*` release it writes into)
+   - **Report source** (which report file / URL it reads from)
+
+   Present these as a table and wait for a "yes" before calling the import API. Never chain imports without this gate. This confirmation is mandatory even when the user says "just import" — echo the four back and confirm.
+
 
 ## Owner name mapping table
 
@@ -67,7 +75,28 @@ Verify reachability: `GET {BASE}/api/releases` — should return a list.
 - Otherwise **default to the latest**: `GET {BASE}/api/releases` returns a list (newest-first); use the **first** element. Tell the user which release was auto-selected.
 - Remember the release for follow-up operations until the user changes it.
 
-## Case matching rules
+## User import habits (Maximus)
+
+Observed defaults for this user's "import / 升级xts" requests — use these as
+sensible starting assumptions, but STILL confirm the four points (HARD RULE 5)
+before writing:
+
+- **Report source is usually Source A** — `http://10.52.9.140/xTS_Report/`,
+  release-RC directory layout, import the `need_check.txt` per (board, suite).
+- **Target release is usually the latest** — e.g. `imx_android-17.0_1.0.0`
+  (from the `android-17.0.0_1.0.0-rc1/` report dir). Verify via `GET /api/releases`.
+- **"检查有没有新报告" ≠ import.** The user often first asks to CHECK for new
+  reports without importing. In that case: list the report server, compare every
+  (mapped board, suite) against `meta.imported`, and REPORT the new ones. Do NOT
+  import until the user explicitly says to.
+- **Authoritative "already imported" state is `meta.imported`**, never memory or a
+  prior chat log. Always re-fetch `GET /api/{release}/meta` and diff against the
+  report server. Some pairs may already be imported from earlier sessions.
+- **Board-name mapping matters** — apply the Source A table (`8MQ_WEVK`→`8MQWEVK`,
+  `8ULP_9x9`→`8ULP9`, `937_FRDM`→`937FRDM`) and confirm each with the user.
+- **Admin password** is required for import; the user supplies it (do not assume).
+- After importing, always deliver the dedup-then-assign reminder (Operation D step 3).
+
 
 All case lookups follow these rules:
 
@@ -128,8 +157,20 @@ Use `GET {BASE}/api/{release}/failures` with `suite`, `board`, `status`, `owner`
 
 1. Confirm admin password.
 2. For each report file the user provides:
-   - Ask/confirm `suite` (e.g. CTS/VTS/CTS-on-GSI/GTS/STS) and `board` (must be one of `meta.boards`).
-   - `POST {BASE}/api/admin/{release}/import` as multipart form.
+   - Resolve `suite` (CTS/VTS/CTS-on-GSI/GTS/STS) and `board` (map to a name in `meta.boards`).
+   - **MANDATORY confirmation gate (HARD RULE 5):** before calling the import API,
+     STOP and show the user a table of the four facts and wait for explicit "yes":
+
+     | Field | Value |
+     |---|---|
+     | Suite | e.g. CTS |
+     | Board (tracker name) | e.g. 952_19x19 |
+     | Database / release | e.g. imx_android-17.0_1.0.0 |
+     | Report source | e.g. http://10.52.9.140/.../952_19x19/CTS/need_check.txt |
+
+     Import writes the live DB and is not trivially undoable — never skip this even
+     if the user said "just import". Echo the four back and confirm first.
+   - After confirmation: `POST {BASE}/api/admin/{release}/import` as multipart form.
    - Report `added`/`updated` counts.
 3. **After all imports are done**, deliver this mandatory reminder:
 
@@ -210,11 +251,21 @@ table or is ambiguous, STOP and ask — never guess.
 
 **Source A (`10.52.9.140`):**
 
-| Report-server dir | Tracker board |
-|---|---|
-| `8MQ_WEVK` | `8MQWEVK` |
-| `8ULP_9x9` | `8ULP9` |
-| all others (`8QM`, `8QXP`, `8MM`, `8MP`, `8MN`, `8ULP`, `95_15x15_FRDM`, `95_19x19`, `952_15x15`, `952_19x19`, `943`, ...) | same name |
+Confirmed tracker board names (from `meta.boards`, release `imx_android-17.0_1.0.0`):
+`8QM`, `8QXP`, `8MM`, `8MN`, `8MQWEVK`, `8MP`, `8ULP`, `8ULP9`, `937FRDM`,
+`95_19x19`, `95_15x15_FRDM`, `952_19x19`. Always re-check `meta.boards` for the
+target release, since the set can differ per release.
+
+| Report-server dir | Tracker board | Note |
+|---|---|---|
+| `8MQ_WEVK` | `8MQWEVK` | drop underscore |
+| `8ULP_9x9` | `8ULP9` | NOT `8ULP` — different board |
+| `937_FRDM` | `937FRDM` | drop underscore |
+| `8ULP` | `8ULP` | same name (distinct from `8ULP9`) |
+| `8QM`, `8QXP`, `8MM`, `8MP`, `8MN`, `95_15x15_FRDM`, `95_19x19`, `952_19x19`, `952_15x15`, `943`, ... | same name | verify against `meta.boards` |
+
+**Watch out:** `8ULP_9x9` → `8ULP9` and plain `8ULP` → `8ULP` are TWO DIFFERENT tracker
+boards. Do not conflate them.
 
 **Source B (`10.193.108.180`, `evk_`/`mek_`/`frdm_` prefixed):**
 
@@ -260,5 +311,6 @@ web UI). Deduplicate and Assign stay manual — do NOT call those APIs.
 - **400 `invalid status`** → status not in whitelist; show `meta.statuses`.
 - **400 `FOREIGN KEY constraint failed`** → owner or status value does not exist in the database; show `meta.owners` or `meta.statuses` accordingly.
 - **401/403** → wrong or missing admin password.
-- **423 `database is locked`** → release is locked for maintenance; tell user to unlock in Admin or wait.
+- **423 `database is locked`** → release is locked for maintenance; tell user to unlock in Admin or wait. (This `db_lock` flag only blocks user-level edits; admin ops ignore it by design.)
+- **500 `database disk image is malformed` during import (or any operation)** → the release DB is CORRUPTED. STOP all writes immediately and tell the user. Historically this was caused by the backup thread racing writes; it is fixed in the backend (per-release write lock + checkpoint-before-backup), but if it ever recurs: do NOT keep importing. Recovery is done OUT-OF-BAND by the maintainer (stop the service, `sqlite3 <db> .recover | sqlite3 <new.db>`, verify `PRAGMA integrity_check` = ok and row counts of `failures`/`suite_board_reports` match, then swap the file while the service is stopped). Never attempt DB-file recovery through this skill's API-only workflow.
 - **Never fall back to editing `.db` directly to work around an API error.**
